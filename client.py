@@ -37,6 +37,9 @@ def get_socket(socket_file):
     return s, sf
 
 
+class RemoteException(Exception): ...
+
+
 class AbstractWorker(ABC):
     def connect(self): ...
 
@@ -104,19 +107,15 @@ class Socket(AbstractWorker):
     def read_msg(self) -> bytes:
         return cm.read_msg(self.in_stream)
     
-    def execute(self, msg: bytes) -> bytes:
-        self.send_msg(msg)
-        return self.read_msg()
-    
     def initialize(self, init_data):
         raw_idx = cm.encode_int(0)
-        msg = cm.compose_msg(INIT, raw_idx, map(cm.dumpb, init_data))
+        msg = cm.compose_msg(raw_idx, cm.CALL, INIT, map(cm.dumpb, init_data))
         self.send_msg(msg)
         logger.debug(f'Sent init data')
         msg, success = self.read_msg()
         logger.debug('Received init response')
         if success:
-            target, ret_raw_idx, _ = cm.decompose_msg(msg)
+            ret_raw_idx, _, target, _ = cm.decompose_msg(msg)
             if target == INIT and ret_raw_idx == raw_idx:
                 self.status = READY_FOR_TASKS
                 logger.info(f'{self.name} is ready for tasks')
@@ -135,15 +134,20 @@ class Socket(AbstractWorker):
         :param idx_args: (index, args)
         '''
         if SINGLETON_TASK:
-            self.send_msg(cm.compose_msg(target, cm.encode_int(idx_args[0]), (cm.dumpb(idx_args[1]),)))
+            self.send_msg(cm.compose_msg(cm.encode_int(idx_args[0]), cm.CALL, target, (cm.dumpb(idx_args[1]),)))
         else: 
-            self.send_msg(cm.compose_msg(target, cm.encode_int(idx_args[0]), map(cm.dumpb, idx_args[1])))
+            self.send_msg(cm.compose_msg(cm.encode_int(idx_args[0]), cm.CALL, map(cm.dumpb, idx_args[1])))
 
     def get_task_result(self):
         msg, success = self.read_msg()
         assert success
-        _, raw_idx, res = cm.decompose_msg(msg)
-        return cm.decode_int(raw_idx, 0), cm.loadb(res[0])
+        raw_idx, outcome, _, res = cm.decompose_msg(msg)
+        if outcome == cm.RETURN:
+            return cm.decode_int(raw_idx, 0), cm.loadb(res[0])
+        elif outcome == cm.RAISE:
+            error = cm.deserialize_exception(res[0])
+            error.idx = cm.decode_int(raw_idx, 0)
+            raise error
         
     def do_task(self, idx_args, target=TASK):
         '''
@@ -198,50 +202,25 @@ class Empty(Exception):
     pass
 
 
-class Node:
-    def __init__(self, task, requestor=''):
-        self.task = task
+class DLLNode:
+    def __init__(self, data):
         self.pred = None
         self.succ = None
-        self.requestor = requestor
-        self.rpred = None
-        self.rsucc = None
+        self.data = data
 
 
-class RequestorQueue:
-    '''
-    Get and the next in line from a specific category or, if none available, just the next in line.
-    Delete elements in O(1) time.
-    '''
+class DoublyLinkedList:
     def __init__(self):
-        self.rheads = {}
         self.head = None
-        self.rtails = {}
         self.tail = None
-        self.qsize = 0
-
-    def __len__(self):
-        return self.qsize
 
     def append(self, new_node):
-        requestor = new_node.requestor
         if self.head is None:
             self.head = new_node
         else:     
             self.tail.succ = new_node
             new_node.pred = self.tail
         self.tail = new_node
-        if requestor not in self.rtails:
-            self.rtails[requestor] = new_node
-            self.rheads[requestor] = new_node
-        else:
-            self.rtails[requestor].rsucc = new_node
-            new_node.rpred = self.rtails[requestor]
-            self.rtails[requestor] = new_node
-        self.qsize += 1
-
-    def __contains__(self, node):
-        return (self.tail is node) if node.succ is None else (node.succ.pred is node)
 
     def discard(self, node):
         if node.succ is None:
@@ -249,7 +228,7 @@ class RequestorQueue:
                 if self.head is node:
                     self.head = self.tail = None
                 else:
-                    return
+                    return 
             else:
                 assert node.pred.succ is node
                 node.pred.succ = None
@@ -263,28 +242,53 @@ class RequestorQueue:
                 assert node.pred.succ is node
                 node.pred.succ = node.succ
                 node.succ.pred = node.pred
-        
-        if node.rsucc is None:
-            if node.rpred is None:
-                del self.rheads[node.requestor]
-                del self.rtails[node.requestor]
-            else:
-                node.rpred.rsucc = None
-                self.rtails[node.requestor] = node.rpred
-        else:
-            if node.rpred is None:
-                node.rsucc.rpred = None
-                self.rheads[node.requestor] = node.rsucc
-            else:
-                node.rpred.rsucc = node.rsucc
-                node.rsucc.rpred = node.rpred
+        node.succ = node.pred = None
+        return 1
 
-        self.qsize -= 1
-        node.succ = node.pred = node.rsucc = node.rpred = None
-     
-    def peekleft(self, requestor=''):
-        assert self.head is not None
-        return self.rheads[requestor] if requestor in self.rheads else self.head
+    def __contains__(self, node):
+        return self.head is node if node.pred is None else node.pred.succ is node
+
+
+class Node:
+    def __init__(self, task, requestor='', labels=None):
+        self.task = task
+        labels = (requestor, '*') if labels is None else labels
+        self.structure = tuple((label, DLLNode(self)) for label in labels)
+
+
+class Multiqueue:
+    '''
+    Multiple queues with same elements.
+    Delete elements in O(1) time.
+    '''
+    def __init__(self):
+        self.queue_dict = {}
+        self.qsize = 0
+
+    def __len__(self):
+        return self.qsize
+
+    def append(self, new_node):
+        for label, dll_node in new_node.structure:
+            self.queue_dict.setdefault(label, DoublyLinkedList()).append(dll_node)
+        self.qsize += 1
+
+    def __contains__(self, node):
+        return (node.structure and node.structure[0][0] in self.queue_dict 
+                and node.structure[0][1] in self.queue_dict[node.structure[0][0]])
+
+    def discard(self, node):
+        popped = False
+        for label, dll_node in node.structure:
+            if label in self.queue_dict:
+                popped = self.queue_dict.discard(dll_node)
+        self.qsize -= popped
+            
+    def peekleft(self, requestor='', labels=None):
+        for label in (requestor, '*') if labels is None else labels:
+            if label in self.queue_dict and self.queue_dict[label].head is not None:
+                return self.queue_dict[label].head.data
+        raise Empty()
 
     def popleft(self, requestor=''):
         node = self.peekleft(requestor=requestor)
@@ -300,7 +304,7 @@ class Sprint:
         self.mutex = Lock()
         self.not_empty = Condition(self.mutex)
         self.init_data = init_data
-        self.tasks = RequestorQueue()
+        self.tasks = Multiqueue()
         self.num_submitted_tasks = 0
         self.nums_submitted_tasks = {}
         self.nums_picked_res = {}
@@ -313,9 +317,8 @@ class Sprint:
         self.requestors = {}
         self.log = Queue()
         self.recycle = {} # {requestor: True|False}
-        self.chunksize = 1
 
-    def submit_tasks(self, tasks, requestor='') -> int:
+    def submit_tasks(self, tasks, requestor='', labels=None) -> int:
         '''
         Submit an ask for execution
         :param tasks:
@@ -331,36 +334,39 @@ class Sprint:
                 task = (seq_num, task)
                 self.num_submitted_tasks += 1
                 self.nums_submitted_tasks[requestor] = self.nums_submitted_tasks.setdefault(requestor, 0) + 1 
-                self.tasks.append(Node(task, requestor=requestor))
+                self.tasks.append(Node(task, requestor=requestor, labels=labels))
             self.not_empty.notify(len(tasks))
             return self.num_submitted_tasks
     
-    def submit_task(self, task, requestor='') -> int:
-        return self.submit_tasks([task], requestor=requestor)
+    def submit_task(self, task, requestor='', labels=None) -> int:
+        return self.submit_tasks([task], requestor=requestor, labels=labels)
     
-    def get_task(self, requestor=''):
+    def get_task(self, requestor='', labels=None):
         '''
         :return: the next task in the queue so as to execute it
         '''
+        if labels is None:
+            labels = (requestor, '*')
         with self.mutex:
             while True:
-                if len(self.tasks):
-                    node = self.tasks.popleft(requestor=requestor)
+                try:
+                    node = self.tasks.popleft(labels=labels)
+                except Empty:
+                    if self.open:
+                        self.not_empty.wait()
+                    else:
+                        raise Empty
+                else:
                     task_to_grab = node.task
                     idx = task_to_grab[0]
                     # idx might already be there...
                     self.in_progress[idx] = node
                     # A batch starts out with recycle set to True 
-                    if self.recycle.setdefault(node.requestor, True):
+                    if self.recycle.setdefault(self.requestors[idx], True):
                         self.tasks.append(node) # let another worker pick it up...
                         self.not_empty.notify()
                     return task_to_grab
-                elif self.open:
-                    self.not_empty.wait()
-                    continue
-                else:
-                    raise Empty
-
+ 
     def submit_result(self, ind: int, result, worker_name):
         '''
         :param ind: the sequence number of the task whose result is being submitted
@@ -420,8 +426,9 @@ class Sprint:
                 self.recycle[requestor] = val
             if val:
                 count = 0
-                for idx, node in self.in_progress.items():
-                    if node not in self.tasks and (all or node.requestor == requestor):
+                for node in self.in_progress.values():
+                    if node not in self.tasks and (all or 
+                        node.task[0] in self.requestors and self.requestors[node.task[0]] == requestor):
                         self.tasks.append(node)
                         count += 1
                 self.not_empty.notify(count)
@@ -431,13 +438,13 @@ class SprintMan:
     '''
     A worker equipped with a queue for sprints to work on and a thread for working on them.
     '''
-    def __init__(self, worker, requestor=''):
+    def __init__(self, worker, requestor='', labels=None):
         self.sprints = Queue()
         self.actual = worker
         self.thread = Thread(target=self.worker_loop, daemon=True)
         self.sprint_status = (None, INSTANTIATED)
         self.stop_order = False
-        self.requestor = requestor
+        self.labels = (requestor, '*') if labels is None else labels
 
     def work_on_sprint(self):
         sprint = self.sprint_status[0]
@@ -449,7 +456,7 @@ class SprintMan:
                 self.stop_order = False
                 break
             try:
-                task = sprint.get_task(requestor=self.requestor)
+                task = sprint.get_task(labels=self.labels)
             except Empty:
                 break
             try:

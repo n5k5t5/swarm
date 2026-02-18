@@ -19,9 +19,14 @@ def worker_loop(input, output, calls):
             when_read = time()
             if not success:
                 return
-            target, raw_idx, args = cm.decompose_msg(msg)
+            raw_idx, _, target, args = cm.decompose_msg(msg)
             func = calls[target]
-            res = cm.compose_msg(target, raw_idx, (cm.dumpb(func(*map(cm.loadb, args))),))
+            try:
+                res = func(*map(cm.loadb, args))
+            except Exception as e:
+                res.cm.compose_msg(raw_idx, cm.RAISE, target, (cm.serialize_exc(e),))
+            else:
+                res = cm.compose_msg(raw_idx, cm.RETURN, target, (cm.dumpb(res),))
             when_calced = time()
             cm.send_msg(res, output)
             when_done = time()

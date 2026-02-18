@@ -10,9 +10,14 @@ INTSIZE = 8
 INIT = b'initialize'
 TASK = b'do_task'
 
-
 encode_int = lambda x: int.to_bytes(x, INTSIZE, BYTE_ORDER)
 decode_int = lambda y, i: int.from_bytes(y[i: i + INTSIZE], BYTE_ORDER)
+
+CALL = encode_int(0)
+RETURN = encode_int(1)
+RAISE = encode_int(2)
+serialize_exc = lambda e: str(e).encode()
+deserialize_exc = lambda b: Exception(b.decode())
 
 
 def send_msg(raw_msg: bytes, out_stream):
@@ -32,10 +37,10 @@ def read_msg(in_stream):
     return raw_msg, INTSIZE + msg_size  # or just anything that has a boolean value of True
 
 
-def encode_iterable(args, msg=b''):
+def encode_iterable(args, prefix=b''):
     for arg in args:
-        msg += encode_int(len(arg)) + arg
-    return msg
+        prefix += encode_int(len(arg)) + arg
+    return prefix
 
 
 def decode_iterable(msg, i=0):
@@ -48,15 +53,14 @@ def decode_iterable(msg, i=0):
 
 
 def decompose_msg(msg: bytes):
-    target_len = decode_int(msg, 0)
+    target_len = decode_int(msg, 2 * INTSIZE)
     # target, raw_idx, args
-    return msg[INTSIZE: INTSIZE + target_len], msg[INTSIZE + target_len: 2 * INTSIZE + target_len], \
-        decode_iterable(msg, 2 * INTSIZE + target_len)
+    return msg[:INTSIZE], msg[INTSIZE: 2 * INTSIZE], msg[3 * INTSIZE: 3 * INTSIZE + target_len], \
+        decode_iterable(msg, 3 * INTSIZE + target_len)
+    
 
-
-def compose_msg(target: bytes, raw_idx: bytes, args: bytes):
-    msg = encode_int(len(target)) + target + raw_idx
-    return encode_iterable(args, msg)
+def compose_msg(raw_idx: bytes, kind: bytes, target: bytes, args: list):
+    return encode_iterable(args, raw_idx + kind + encode_int(len(target)) + target)
 
 
 class Logger:
